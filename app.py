@@ -22,7 +22,7 @@ st.set_page_config(
 # ══════════════════════════════════════════════════════
 @st.cache_data
 def load_data():
-    df = pd.read_csv("data/insurance_data.csv")
+    df = pd.read_csv("insurance_data.csv")
     df.columns = df.columns.str.strip().str.upper()
     return df
 
