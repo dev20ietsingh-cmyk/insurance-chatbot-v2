@@ -22,7 +22,7 @@ st.set_page_config(
 # ══════════════════════════════════════════════════════
 @st.cache_data
 def load_data():
-    df = pd.read_csv("insurance_data.csv")
+    df = pd.read_csv("data/insurance_data.csv")
     df.columns = df.columns.str.strip().str.upper()
     return df
 
@@ -125,7 +125,12 @@ USER ALIASES — map user words to correct columns:
   "zone" / "risk zone"   → RISKZONE
   "imd"                  → I_IMD_NAME
   "sub channel"          → ORG_SUB_CHANNEL_NAME
-  "OD LR" / "OD loss ratio" / "loss ratio" → OD Loss Ratio formula (default)
+  "loss ratio" / "LR"          → COMBINED OD+TP Loss Ratio (DEFAULT)
+  "OD LR" / "OD loss ratio"    → OD only Loss Ratio formula
+  "TP LR" / "TP loss ratio"    → TP only Loss Ratio formula
+  "frequency"                  → COMBINED OD+TP Frequency (DEFAULT)
+  "OD frequency"               → OD only Frequency formula
+  "TP frequency"               → TP only Frequency formula
   "TP LR" / "TP loss ratio"                → TP Loss Ratio formula
   "claims"               → OD_CLAIM_AMOUNT (default unless user says TP)
   "premium"              → OD_NET_EARNED_PREMIUM (default unless user says TP)
@@ -159,6 +164,42 @@ RULE 5 — Year-on-year comparison (both years as columns):
   Use groupby with FY_YEAR + unstack — do NOT filter by year:
   df.groupby(['CUSTOMER_STATE', 'FY_YEAR']).apply(lambda x: round(x['OD_CLAIM_AMOUNT'].sum() / x['OD_NET_EARNED_PREMIUM'].sum() * 100, 2)).unstack('FY_YEAR').rename(columns={{'FY-2023-24': 'OD_LR_FY23-24_%', 'FY-2024-25': 'OD_LR_FY24-25_%'}}).reset_index()
 
+RULE 5B — For YoY comparison WITH a calculated CHANGE/DELTA column:
+  NEVER use .unstack() when you need to add change/delta columns afterward —
+  the flattened column names after unstack+rename are unreliable.
+
+  Instead, use groupby(['DIM','FY_YEAR']) + pivot_table, which gives clean flat column names:
+
+  ✅ CORRECT PATTERN:
+  df.groupby(['V_VEHICLE_TYPE', 'FY_YEAR']).apply(lambda x: pd.Series({{'OD_LR': round(x['OD_CLAIM_AMOUNT'].sum() / x['OD_NET_EARNED_PREMIUM'].sum() * 100, 2), 'TP_LR': round(x['TP_CLAIM_AMOUNT'].sum() / x['TP_NET_EARNED_PREMIUM'].sum() * 100, 2)}})).reset_index().pivot_table(index='V_VEHICLE_TYPE', columns='FY_YEAR', values=['OD_LR','TP_LR']).pipe(lambda t: t.set_axis([f"{{a}}_{{b}}" for a,b in t.columns], axis=1)).reset_index().assign(**{{'OD_CHANGE': lambda t: t['OD_LR_FY-2024-25'] - t['OD_LR_FY-2023-24'], 'TP_CHANGE': lambda t: t['TP_LR_FY-2024-25'] - t['TP_LR_FY-2023-24']}}).sort_values('OD_CHANGE', ascending=False)
+
+  KEY RULE: after pivot_table with MultiIndex columns, ALWAYS flatten with:
+  .pipe(lambda t: t.set_axis([f"{{a}}_{{b}}" for a,b in t.columns], axis=1))
+  This guarantees column names are exactly "METRIC_FY-YYYY-YY" — predictable and always exists.
+
+  ❌ NEVER assume a column name exists after .unstack().rename() without flattening it explicitly first.
+  ❌ NEVER reference a column name you have not explicitly created via flattening — it will KeyError.  
+RULE 5C — For YoY comparison with SINGLE metric + MULTIPLE groupby dimensions:
+  When pivoting with values=ONE column, pivot_table columns become EXACTLY the
+  raw FY_YEAR values — e.g. columns are literally 'FY-2023-24' and 'FY-2024-25'
+  (NOT prefixed with the metric name). You MUST rename them before referencing
+  in .assign() or .pipe() — skipping rename WILL cause a KeyError.
+
+  ✅ CORRECT — single metric, multi-dimension YoY with change column (4 steps, in order):
+  Step 1: groupby + apply → Step 2: rename 0 to metric name → Step 3: pivot_table →
+  Step 4: rename FY_YEAR columns to final names BEFORE using them in assign/pipe.
+
+  FULL CORRECT EXAMPLE:
+  df.groupby(['P_ACC_LOB', 'I_IMD_NAME', 'FY_YEAR']).apply(lambda x: round(x['TP_NOC'].sum() / x['TP_NOP'].sum() * 100, 2)).reset_index().rename(columns={{0: 'TP_FREQ'}}).pivot_table(index=['P_ACC_LOB', 'I_IMD_NAME'], columns='FY_YEAR', values='TP_FREQ').reset_index().rename(columns={{'FY-2023-24': 'TP_FREQ_FY23_24', 'FY-2024-25': 'TP_FREQ_FY24_25'}}).assign(**{{'TP_FREQ_CHANGE': lambda t: t['TP_FREQ_FY24_25'] - t['TP_FREQ_FY23_24']}}).pipe(lambda t: t[t['TP_FREQ_CHANGE'] > 0]).sort_values('TP_FREQ_CHANGE', ascending=False).head(10)
+
+  CRITICAL: After pivot_table+reset_index, the new columns are EXACTLY the FY_YEAR
+  values (e.g. 'FY-2023-24', 'FY-2024-25') — nothing else. ALWAYS add a .rename()
+  step immediately after reset_index() to relabel them before any further reference.
+
+  ❌ WRONG — referencing a metric-prefixed name that was never created:
+  .pivot_table(..., values='TP_FREQ').reset_index().assign(... t['TP_FREQ_FY-2024-25'] ...)
+  ← WRONG: column is just 'FY-2024-25', not 'TP_FREQ_FY-2024-25', because rename was skipped.
+    
 RULE 6 — Two-step questions (find top X THEN drill down) = TWO semicolon-separated statements:
   Statement 1 → find the top entity
   Statement 2 → drill into sub-dimension dynamically using idxmax()
@@ -276,13 +317,64 @@ RULE 9 — For SINGLE VALUE queries (no groupby needed):
   
   ❌ WRONG — any code with = assignment inside eval:
   state_lr = ...  ← assignment breaks eval()
+  
+  RULE 20 — For OVERALL summary queries (no groupby needed):
+  When user asks for "overall", "total", "aggregate", use TWO semicolon statements.
 
-RULE 16 — NEVER use variable assignment inside pandas_code:
-  eval() cannot execute assignment statements (=).
-  Everything must be a single chained expression.
-  ✅ Use .pipe() for intermediate filtering
-  ✅ Use nested expressions for threshold values
-  ❌ Never: var = value; use_var_here
+  ALWAYS USE THIS EXACT PATTERN — no exceptions:
+  _d = df[df['FY_YEAR'] == 'FY-2024-25']; pd.DataFrame({{'LOSS_RATIO_PCT': [round((_d['OD_CLAIM_AMOUNT'].sum() + _d['TP_CLAIM_AMOUNT'].sum()) / (_d['OD_NET_EARNED_PREMIUM'].sum() + _d['TP_NET_EARNED_PREMIUM'].sum()) * 100, 2)], 'FREQUENCY_PCT': [round((_d['OD_NOC'].sum() + _d['TP_NOC'].sum()) / (_d['OD_NOP'].sum() + _d['TP_NOP'].sum()) * 100, 2)]}})
+
+  IF NO YEAR FILTER:
+  _d = df; pd.DataFrame({{'LOSS_RATIO_PCT': [round((_d['OD_CLAIM_AMOUNT'].sum() + _d['TP_CLAIM_AMOUNT'].sum()) / (_d['OD_NET_EARNED_PREMIUM'].sum() + _d['TP_NET_EARNED_PREMIUM'].sum()) * 100, 2)], 'FREQUENCY_PCT': [round((_d['OD_NOC'].sum() + _d['TP_NOC'].sum()) / (_d['OD_NOP'].sum() + _d['TP_NOP'].sum()) * 100, 2)]}})
+
+  ❌ NEVER USE .agg() for overall queries — it breaks:
+  df[...].agg(LOSS_RATIO_PCT=(...), FREQUENCY_PCT=(...))  ← WRONG, never do this
+
+  ❌ NEVER USE nested pd.DataFrame with direct df[] — parenthesis errors:
+  pd.DataFrame({{'LOSS_RATIO_PCT': [round(df[...]['OD_CLAIM_AMOUNT']...)]}})  ← WRONG
+
+  ✅ ALWAYS USE _d as temp variable with semicolon pattern — this is the ONLY correct way.
+
+  RULE 20B — For OVERALL summary COMPARING TWO YEARS (current vs last year, YoY):
+  Use groupby on FY_YEAR only (no other dimension) with the _d pattern — ONE statement, no semicolon needed:
+
+  ✅ CORRECT — overall combined Loss Ratio + Frequency, current year vs last year:
+  df.groupby('FY_YEAR').apply(lambda x: pd.Series({{'LOSS_RATIO_PCT': round((x['OD_CLAIM_AMOUNT'].sum() + x['TP_CLAIM_AMOUNT'].sum()) / (x['OD_NET_EARNED_PREMIUM'].sum() + x['TP_NET_EARNED_PREMIUM'].sum()) * 100, 2), 'FREQUENCY_PCT': round((x['OD_NOC'].sum() + x['TP_NOC'].sum()) / (x['OD_NOP'].sum() + x['TP_NOP'].sum()) * 100, 2)}})).reset_index()
+
+  This returns ONE row per FY_YEAR with both metrics as columns — perfect for "current vs last year" questions.
+
+  ❌ NEVER invent variable names like df_current/df_last/df_previous — they are NEVER defined and will always error.
+  ❌ NEVER use two separate semicolon statements for this — use the single groupby('FY_YEAR') pattern above.
+
+  DECISION RULE:
+  - "overall X for FY-2024-25" (one year only) → RULE 20 pattern (_d =, filtered to one year)
+  - "overall X current year vs last year" / "YoY" / "compare years" (no other dimension) → RULE 20B pattern (groupby FY_YEAR)
+  - "X by state/channel for FY-2024-25" → RULE 3/21 pattern (groupby dimension, filtered to one year)
+
+  RULE 21 — COMBINED OD+TP formulas (DEFAULT when user says just "loss ratio" or "frequency"):
+  When user asks for "loss ratio" or "frequency" WITHOUT specifying OD or TP,
+  ALWAYS use the combined OD+TP formula:
+
+  COMBINED LOSS RATIO formula (use inside lambda x):
+  round((x['OD_CLAIM_AMOUNT'].sum() + x['TP_CLAIM_AMOUNT'].sum()) / (x['OD_NET_EARNED_PREMIUM'].sum() + x['TP_NET_EARNED_PREMIUM'].sum()) * 100, 2)
+
+  COMBINED FREQUENCY formula (use inside lambda x):
+  round((x['OD_NOC'].sum() + x['TP_NOC'].sum()) / (x['OD_NOP'].sum() + x['TP_NOP'].sum()) * 100, 2)
+
+  CORRECT — combined loss ratio by state (groupby):
+  df.groupby('CUSTOMER_STATE').apply(lambda x: pd.Series({{'LOSS_RATIO_PCT': round((x['OD_CLAIM_AMOUNT'].sum() + x['TP_CLAIM_AMOUNT'].sum()) / (x['OD_NET_EARNED_PREMIUM'].sum() + x['TP_NET_EARNED_PREMIUM'].sum()) * 100, 2), 'FREQUENCY_PCT': round((x['OD_NOC'].sum() + x['TP_NOC'].sum()) / (x['OD_NOP'].sum() + x['TP_NOP'].sum()) * 100, 2)}})).reset_index()
+
+  DECISION RULE for OD vs TP vs COMBINED:
+  - User says "loss ratio" or "frequency" alone → COMBINED OD+TP formula
+  - User says "OD loss ratio" or "OD frequency" → OD only formula
+  - User says "TP loss ratio" or "TP frequency" → TP only formula
+  ALWAYS use LOSS_RATIO_PCT and FREQUENCY_PCT as column names (never use % in column names).
+  
+RULE 16 — Variable assignment is ONLY allowed in the RULE 20 `_d =` pattern:
+  Outside of RULE 20's exact `_d = df[...]; pd.DataFrame({...})` pattern,
+  never use assignment (=) inside pandas_code — eval() can't run it.
+  ❌ Never invent new variable names like df_current, df_last, state_lr, etc.
+  ✅ Only `_d` is supported as a temp variable, and only for RULE 20.
 
  RULE 17 — NEVER use % symbol in .assign() column names — Python syntax error:
   .assign() uses keyword arguments — % is illegal in Python variable names.
@@ -442,7 +534,34 @@ def run_code(code, df):
             return pivot
         except Exception:
             return data
+    
+    # ── INTERCEPT overall summary queries using .agg() with lambdas ──
+    # Convert .agg({'COL': lambda x: ...}) to _d pattern automatically
+    if ".agg({" in code and "lambda" in code and "groupby" not in code:
+        try:
+            # Extract FY year filter if present
+            fy_match = re.search(r"FY_YEAR.*?==.*?'(FY-\d{4}-\d{2})'", code)
+            if fy_match:
+                fy = fy_match.group(1)
+                _d = df[df['FY_YEAR'] == fy]
+            else:
+                _d = df.copy()
 
+            loss_ratio = round(
+                (_d['OD_CLAIM_AMOUNT'].sum() + _d['TP_CLAIM_AMOUNT'].sum()) /
+                (_d['OD_NET_EARNED_PREMIUM'].sum() + _d['TP_NET_EARNED_PREMIUM'].sum()) * 100, 2
+            )
+            frequency = round(
+                (_d['OD_NOC'].sum() + _d['TP_NOC'].sum()) /
+                (_d['OD_NOP'].sum() + _d['TP_NOP'].sum()) * 100, 2
+            )
+            result = pd.DataFrame({
+                'LOSS_RATIO_PCT': [loss_ratio],
+                'FREQUENCY_PCT': [frequency]
+            })
+            return normalize(result)
+        except Exception:
+            pass  # fall through to normal eval if this fails
     statements = [s.strip() for s in code.split(";") if s.strip()]
 
     if len(statements) == 1:
@@ -450,19 +569,32 @@ def run_code(code, df):
         return auto_pivot(normalize(res))
 
     else:
-        results = []
-        for stmt in statements:
-            label = None
-            if "FY-2024-25" in stmt:
-                label = "FY-2024-25"
-            elif "FY-2023-24" in stmt:
-                label = "FY-2023-24"
-            try:
-                res = eval(stmt, eval_globals)
-                results.append({"label": label, "data": auto_pivot(normalize(res, label))})
-            except Exception as e:
-                results.append({"label": label or "Error", "data": pd.DataFrame({"Error": [str(e)]})})
-        return results
+        # Check if it's an assignment+result pattern (e.g. _d = df[...]; pd.DataFrame(...))
+        has_assignment = any("=" in s and not s.strip().startswith("df") for s in statements[:-1])
+
+        if has_assignment:
+            # Use exec for assignments, eval for final result
+            local_vars = {}
+            for stmt in statements[:-1]:
+                exec(stmt, eval_globals, local_vars)
+            eval_globals.update(local_vars)
+            res = eval(statements[-1], eval_globals)
+            return auto_pivot(normalize(res))
+
+        else:
+            results = []
+            for stmt in statements:
+                label = None
+                if "FY-2024-25" in stmt:
+                    label = "FY-2024-25"
+                elif "FY-2023-24" in stmt:
+                    label = "FY-2023-24"
+                try:
+                    res = eval(stmt, eval_globals)
+                    results.append({"label": label, "data": auto_pivot(normalize(res, label))})
+                except Exception as e:
+                    results.append({"label": label or "Error", "data": pd.DataFrame({"Error": [str(e)]})})
+            return results
 
 # ══════════════════════════════════════════════════════
 # 6. FORMAT DATAFRAME — works with any column names
@@ -476,7 +608,8 @@ def format_df(df_in):
         # Format as % ONLY if column name explicitly contains LR or LOSS_RATIO
         # NOT for generic VALUE column
         if any(k in col_up for k in ["LOSS_RATIO", "_LR_%", "LR_%", "_LR",
-                                      "FREQUENCY", "FREQ", "STATE_OD", "STATE_TP"]) \
+                              "FREQUENCY", "FREQ", "STATE_OD", "STATE_TP",
+                              "_PCT", "RATIO_PCT", "FREQ_PCT"]) \
                 and col_up != "VALUE":
             out[col] = pd.to_numeric(out[col], errors="coerce")
             out[col] = out[col].apply(
@@ -739,7 +872,7 @@ if data_loaded:
                 raw         = ""
                 try:
                     system_prompt = build_system_prompt(df)
-                    MODELS = ["meta-llama/llama-4-scout-17b-16e-instruct", "llama-3.1-8b-instant", "openai/gpt-oss-20b"]
+                    MODELS = ["meta-llama/llama-4-scout-17b-16e-instruct", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
                     resp = None
                     last_error = None
                     for model_name in MODELS:
@@ -762,8 +895,27 @@ if data_loaded:
                                 raise e
                     if resp is None:
                         raise Exception(f"All models rate limited. Try again in 10 min.")
-                    raw         = resp.choices[0].message.content.strip()
-                    parsed      = parse_groq_response(raw)
+                    raw = resp.choices[0].message.content.strip()
+
+                    # Sanity check: reject garbled output before attempting to parse
+                    if len(raw) > 3000 or raw.count("#") > 20 or raw.count("@") > 5:
+                        raise ValueError("AI returned malformed output. Please try rephrasing your question or ask again.")
+
+                    parsed = parse_groq_response(raw)
+
+                    if isinstance(parsed, str):
+                        parsed = json.loads(parsed)
+                    if not isinstance(parsed, dict):
+                        raise ValueError(f"Unexpected response format from AI: {type(parsed)}")
+
+                    # Guard: if parsing returned a string (double-encoded JSON), parse again
+                    if isinstance(parsed, str):
+                        parsed = json.loads(parsed)
+
+                    # Guard: if still not a dict, raise a clear error
+                    if not isinstance(parsed, dict):
+                        raise ValueError(f"Unexpected response format from AI: {type(parsed)} — {parsed}")
+
                     pandas_code = parsed.get("pandas_code", "")
                     explanation = parsed.get("explanation", "")
                     result      = run_code(pandas_code, df)
